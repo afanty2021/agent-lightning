@@ -1,8 +1,8 @@
 # Tinker + Agent-lightning Integration
 
-This example shows how to use [Tinker's reinforcement-learning infrastructure](https://tinker-docs.thinkingmachines.ai/) as a fine-tuning backend for agents written against Agent-lightning. You author the agent exactly the way you would for deployment, while the bridge code reconstructs Tinker-compatible trajectories from Agent-lightning traces.
+[![tinker CI status](https://github.com/microsoft/agent-lightning/actions/workflows/examples-tinker.yml/badge.svg)](https://github.com/microsoft/agent-lightning/actions/workflows/examples-tinker.yml)
 
-**NOTE: The example is tested and compatible with Agent-lightning v0.2.x, but it's not yet maintained on CI due to the cost of running the Tinker training service.**
+This example shows how to use [Tinker's reinforcement-learning infrastructure](https://tinker-docs.thinkingmachines.ai/) as a fine-tuning backend for agents written against Agent-lightning. You author the agent exactly the way you would for deployment, while the bridge code reconstructs Tinker-compatible trajectories from Agent-lightning traces.
 
 ## How this differs from the original Tinker Cookbook RL recipe
 
@@ -147,7 +147,7 @@ dotenv run python q20_train.py algo --model qwen30b --search --port 4747
 dotenv run python q20_train.py runner --port 4747 --n-runners 4
 ```
 
-`--model` selects the Tinker-hosted checkpoint (`qwen4b` or `qwen30b`). Add `--search` to enable the mocked search tool, which relies on the helper LLM defined in the environment variables (the example uses an LLM-powered search simulation instead of a real API). Training metrics and checkpoints are recorded under `examples/tinker/logs/q20_*`.
+`--model` selects the Tinker-hosted checkpoint (`qwen4b` or `qwen30b`). Add `--search` to enable the mocked search tool, which relies on the helper LLM defined in the environment variables (the example uses an LLM-powered search simulation instead of a real API). Training metrics and checkpoints are recorded under `examples/tinker/logs/q20_*`. You can also use `verl` as a substitute for the `algo` command when Tinker service is not available.
 
 You can run additional runner processes at any time; they register with the store and start dequeuing tasks immediately.
 

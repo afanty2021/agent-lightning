@@ -1,13 +1,124 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-import multiprocessing
-from typing import Any, Optional, Union
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any, List, Optional, Union
 
 import agentops
+import pytest
+import pytest_asyncio
+import uvicorn
 from agentops.sdk.core import TraceContext
+from fastapi import FastAPI, Request
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceRequest,
+    ExportTraceServiceResponse,
+)
+from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace.status import StatusCode
+from portpicker import pick_unused_port
 
+from agentlightning.store.base import LightningStore, LightningStoreCapabilities
 from agentlightning.tracer.agentops import AgentOpsTracer
+from agentlightning.types import Span, TraceStatus
+from agentlightning.utils import otlp
+
+pytestmark = [pytest.mark.agentops]
+
+
+@pytest_asyncio.fixture
+async def agentops_tracer():
+    tracer = AgentOpsTracer()
+    with tracer.lifespan():
+        async with tracer.trace_context():
+            yield tracer
+
+
+class MockOTLPService:
+    """A mock OTLP server to capture trace export requests for testing purposes."""
+
+    def __init__(self) -> None:
+        self.received: List[ExportTraceServiceRequest] = []
+
+    def start_service(self) -> int:
+        app = FastAPI()
+
+        @app.post("/v1/traces")
+        async def _export_traces(request: Request):  # type: ignore
+            async def capture(message: ExportTraceServiceRequest) -> None:
+                self.received.append(message)
+
+            return await otlp.handle_otlp_export(
+                request,
+                ExportTraceServiceRequest,
+                ExportTraceServiceResponse,
+                capture,
+                signal_name="traces",
+            )
+
+        port = pick_unused_port()
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+        self.server = uvicorn.Server(config)
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+        self.thread.start()
+        timeout = time.time() + 5
+        while not getattr(self.server, "started", False):
+            if time.time() > timeout:
+                raise RuntimeError("OTLP test server failed to start")
+            if not self.thread.is_alive():
+                raise RuntimeError("OTLP test server thread exited before startup")
+            time.sleep(0.01)
+
+        return port
+
+    def stop_service(self) -> None:
+        self.server.should_exit = True
+        self.thread.join(timeout=5)
+
+    def get_traces(self) -> List[ExportTraceServiceRequest]:
+        return self.received
+
+
+class MockLightningStore(LightningStore):
+    """A minimal stub-only LightningStore, only implements methods likely used in tests."""
+
+    def __init__(self, server_port: int = 80) -> None:
+        super().__init__()
+        self.otlp_traces = False
+        self.server_port = server_port
+
+    def enable_otlp_traces(self) -> None:
+        self.otlp_traces = True
+
+    async def add_otel_span(
+        self,
+        rollout_id: str,
+        attempt_id: str,
+        readable_span: ReadableSpan,
+        sequence_id: int | None = None,
+    ) -> Span:
+        if sequence_id is None:
+            sequence_id = 0
+
+        span = Span.from_opentelemetry(
+            readable_span, rollout_id=rollout_id, attempt_id=attempt_id, sequence_id=sequence_id
+        )
+        return span
+
+    @property
+    def capabilities(self) -> LightningStoreCapabilities:
+        """Return the capabilities of the store."""
+        return LightningStoreCapabilities(
+            async_safe=False,
+            thread_safe=False,
+            zero_copy=False,
+            otlp_traces=self.otlp_traces,
+        )
+
+    def otlp_traces_endpoint(self) -> str:
+        return f"http://127.0.0.1:{self.server_port}/v1/traces"
 
 
 def _func_with_exception():
@@ -20,35 +131,42 @@ def _func_without_exception():
     pass
 
 
-def test_trace_error_status_from_instance():
-    """
-    Test that AgentOpsTracer correctly sets trace end state based on execution result.
+def test_agentops_tracer_create_span(agentops_tracer: AgentOpsTracer) -> None:
+    status = TraceStatus(status_code="ERROR", description="agentops")
 
-    This test replaces `agentops.end_trace` with a custom function to capture
-    the `end_state` passed in. It verifies that traces ending after a raised
-    exception have `StatusCode.ERROR`, while normal runs have `StatusCode.OK`.
-    """
-
-    ctx = multiprocessing.get_context("spawn")
-    proc = ctx.Process(target=_test_trace_error_status_from_instance_imp)
-    proc.start()
-    proc.join(30.0)  # On GPU server, the time is around 10 seconds.
-
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(5)
-        if proc.is_alive():
-            proc.kill()
-
-        assert False, "Child process hung. Check test output for details."
-
-    assert proc.exitcode == 0, (
-        f"Child process for test_trace_error_status_from_instance failed with exit code {proc.exitcode}. "
-        "Check child traceback in test output."
+    span = agentops_tracer.create_span(
+        "agentops-span",
+        attributes={"foo": "bar"},
+        status=status,
+        timestamp=42_000.0,
     )
 
+    assert span.name == "agentops-span"
+    assert span.attributes["foo"] == "bar"
+    assert span.status.status_code == "ERROR"
+    assert span.status.description == "agentops"
+    assert span.start_time is not None
+    assert span.end_time is not None
 
-def _test_trace_error_status_from_instance_imp():
+
+def test_agentops_tracer_operation_context_records_exception(agentops_tracer: AgentOpsTracer) -> None:
+    with pytest.raises(ValueError):
+        with agentops_tracer.operation_context("agentops-op", attributes={"foo": "bar"}) as ctx:
+            raise ValueError("agentops boom")
+
+    recorded_span = ctx.get_recorded_span()  # type: ignore
+    assert recorded_span.name == "agentops-op"
+    assert recorded_span.status.status_code == "ERROR"
+    assert recorded_span.status.description is not None
+    assert "agentops boom" in recorded_span.status.description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_exception", [True, False])
+async def test_trace_error_status_from_instance(with_exception: bool):
+    import agentlightning
+
+    agentlightning.setup_logging("DEBUG")
     captured_state = {}
     old_end_trace = agentops.end_trace
 
@@ -61,17 +179,64 @@ def _test_trace_error_status_from_instance_imp():
     agentops.end_trace = custom_end_trace
 
     tracer = AgentOpsTracer()
-    tracer.init()
-    tracer.init_worker(0)
+    with tracer.lifespan():
+        try:
+            if with_exception:
+                with pytest.raises(ValueError):
+                    async with tracer.trace_context():
+                        _func_with_exception()
+                assert captured_state["state"] == StatusCode.ERROR
+            else:
+                async with tracer.trace_context():
+                    _func_without_exception()
+                assert captured_state["state"] == StatusCode.OK
+        finally:
+            agentops.end_trace = old_end_trace
 
-    try:
-        tracer.trace_run(_func_with_exception)
-        assert captured_state["state"] == StatusCode.ERROR
 
-        tracer.trace_run(_func_without_exception)
-        assert captured_state["state"] == StatusCode.OK
+@pytest.mark.asyncio
+async def test_agentops_trace_without_store():
+    tracer = AgentOpsTracer()
 
-    finally:
-        agentops.end_trace = old_end_trace
-        tracer.teardown_worker(0)
-        tracer.teardown()
+    with tracer.lifespan():
+        # Using AgentOpsTracer to trace a function without providing a store, rollout_id, or attempt_id.
+        async with tracer.trace_context(name="agentops_test"):
+            _func_without_exception()
+        spans = tracer.get_last_trace()
+        assert len(spans) > 0
+
+
+@pytest.mark.asyncio
+async def test_agentops_trace_with_store_disable():
+    tracer = AgentOpsTracer()
+
+    with tracer.lifespan():
+        # Using AgentOpsTracer to trace a function with providing a store which disabled native otlp exporter, rollout_id, and attempt_id.
+        store = MockLightningStore()
+        async with tracer.trace_context(
+            name="agentops_test", store=store, rollout_id="test_rollout_id", attempt_id="test_attempt_id"
+        ):
+            _func_without_exception()
+        spans = tracer.get_last_trace()
+        assert len(spans) > 0
+
+
+@pytest.mark.asyncio
+async def test_agentops_trace_with_store_enable():
+    mock_service = MockOTLPService()
+    port = mock_service.start_service()
+
+    tracer = AgentOpsTracer()
+
+    with tracer.lifespan():
+        try:
+            # Using AgentOpsTracer to trace a function with providing a store which disabled native otlp exporter, rollout_id, and attempt_id.
+            store = MockLightningStore(port)
+            async with tracer.trace_context(
+                name="agentops_test", store=store, rollout_id="test_rollout_id", attempt_id="test_attempt_id"
+            ):
+                _func_without_exception()
+            spans = tracer.get_last_trace()
+            assert len(spans) > 0
+        finally:
+            mock_service.stop_service()
